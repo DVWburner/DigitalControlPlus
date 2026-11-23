@@ -212,7 +212,7 @@ enum CarCrypto {
     private static func computeEtMTag(macKey: Data, aad: Data, iv: Data, ct: Data) -> Data {
         var hmac = HMAC<SHA256>(key: SymmetricKey(data: macKey))
         var lenBe = UInt32(aad.count).bigEndian
-        withUnsafeBytes(of: &lenBe) { hmac.update(bufferPointer: $0) }
+        withUnsafeBytes(of: &lenBe) { hmac.update(data: $0) }
         hmac.update(data: aad)
         hmac.update(data: iv)
         hmac.update(data: ct)
