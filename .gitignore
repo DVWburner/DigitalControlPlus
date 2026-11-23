@@ -1,0 +1,14 @@
+build/
+dist/
+keys/
+*.keystore
+*.p12
+*.key
+*.key.pub
+.DS_Store
+Thumbs.db
+*.xcodeproj
+*.xcworkspace
+DerivedData/
+*.ipa
+Payload/

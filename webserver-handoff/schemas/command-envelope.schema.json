@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/command-envelope.schema.json",
+  "title": "Gen5W E2EE Signed Remote Command Envelope",
+  "type": "object",
+  "required": [
+    "commandId",
+    "carId",
+    "phoneId",
+    "issuedAtMs",
+    "expiresAtMs",
+    "ttlSeconds",
+    "e2ee",
+    "phoneSignature"
+  ],
+  "properties": {
+    "commandId": {
+      "type": "string",
+      "pattern": "^cmd_[0-9a-f]{24,40}$"
+    },
+    "carId": {
+      "type": "string",
+      "pattern": "^car_[0-9a-f]{24}$"
+    },
+    "phoneId": {
+      "type": "string",
+      "pattern": "^ph_[0-9a-f]{16,32}$"
+    },
+    "issuedAtMs": {
+      "type": "integer",
+      "minimum": 1700000000000
+    },
+    "expiresAtMs": {
+      "type": "integer",
+      "minimum": 1700000000000
+    },
+    "ttlSeconds": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 300
+    },
+    "e2ee": {
+      "type": "object",
+      "required": ["ephemeralPubKey", "iv", "ciphertext", "mac"],
+      "properties": {
+        "ephemeralPubKey": { "type": "string", "minLength": 80, "maxLength": 200 },
+        "iv": { "type": "string", "minLength": 20, "maxLength": 32 },
+        "ciphertext": { "type": "string", "minLength": 20, "maxLength": 32768 },
+        "mac": { "type": "string", "minLength": 40, "maxLength": 64 }
+      },
+      "additionalProperties": false
+    },
+    "phoneSignature": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 160
+    },
+    "pairingProof": {
+      "type": "object",
+      "properties": {
+        "phonePublicKey": { "type": "string" },
+        "pairedAtMs": { "type": "integer" },
+        "carGrantSignature": { "type": "string" }
+      }
+    },
+    "clientHint": {
+      "type": "string",
+      "maxLength": 160
+    }
+  },
+  "additionalProperties": false
+}

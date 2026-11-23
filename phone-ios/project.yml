@@ -1,0 +1,23 @@
+name: Gen5WDigitalControl
+options:
+  bundleIdPrefix: com.gen5w.digitalcontrol
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "16.0"
+targets:
+  Gen5WDigitalControl:
+    type: application
+    platform: iOS
+    sources:
+      - path: Gen5WDigitalControl
+        excludes:
+          - "Info.plist"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.gen5w.digitalcontrol.ios
+        PRODUCT_NAME: Gen5WDigitalControl
+        INFOPLIST_KEY_CFBundleDisplayName: "Digital Control+"
+        INFOPLIST_FILE: Gen5WDigitalControl/Info.plist
+        SWIFT_VERSION: "5.9"
+        TARGETED_DEVICE_FAMILY: "1"
+        SUPPORTS_MACCATALYST: NO

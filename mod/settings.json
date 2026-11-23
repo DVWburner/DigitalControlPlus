@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "settings": [
+    {
+      "key": "show_command_toasts",
+      "type": "toggle",
+      "default": true,
+      "title": "Show on-screen toast when phone commands execute",
+      "description": "Displays a brief OEM confirmation banner on the head unit screen when a paired phone triggers a car control or Climate Theme."
+    },
+    {
+      "key": "allow_bluetooth_control",
+      "type": "toggle",
+      "default": true,
+      "title": "Enable Bluetooth companion link",
+      "description": "Allows already-paired trusted phones within Bluetooth range to view charging status and execute vehicle commands while the head unit is on."
+    }
+  ]
+}
