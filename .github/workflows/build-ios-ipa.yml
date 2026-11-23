@@ -1,0 +1,57 @@
+name: Build Digital Control+ iOS IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-ios-ipa:
+    runs-on: macos-latest
+    permissions:
+      contents: write
+    defaults:
+      run:
+        working-directory: phone-ios
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode Project
+        run: xcodegen generate
+
+      - name: Build Digital Control+ (Release, Unsigned for Sideloadly / AltStore)
+        run: |
+          xcodebuild clean build \
+            -project Gen5WDigitalControl.xcodeproj \
+            -scheme Gen5WDigitalControl \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Package DigitalControlPlus-1.0.0.ipa
+        run: |
+          rm -rf Payload
+          mkdir -p Payload
+          cp -r build/Build/Products/Release-iphoneos/Gen5WDigitalControl.app Payload/
+          zip -r DigitalControlPlus-1.0.0.ipa Payload
+
+      - name: Upload DigitalControlPlus IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DigitalControlPlus-IPA
+          path: phone-ios/DigitalControlPlus-1.0.0.ipa
+
+      - name: Attach IPA to GitHub Release v1.0.0 (if present)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view v1.0.0 >/dev/null 2>&1; then
+            gh release upload v1.0.0 DigitalControlPlus-1.0.0.ipa --clobber
+          fi
