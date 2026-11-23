@@ -6,8 +6,9 @@ Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $Root = Split-Path -Parent $PSScriptRoot
-$Version = "1.0.0"
+$Version = "1.1.0"
 $ModId = "gen5w-digital-control"
+$NemesisPkgId = "gen5w.digitalcontrol"
 $ModDisplayName = "Digital Control+"
 
 function Resolve-ExistingPath([string[]]$Candidates, [string]$Label) {
@@ -56,12 +57,6 @@ $FrameworkRes = Resolve-ExistingPath @(
     (Join-Path $WorkspaceParent "Gen5WThemer\oem-dump\Gen5W_Theme_Dump\04_apks\framework\framework-res.apk")
 ) "stock Gen5W framework-res.apk (provides android:disableSS)"
 
-$HmgApiRef = Resolve-ExistingPath @(
-    $env:HMGAPI_REPO,
-    (Join-Path $Root "..\HMG-API"),
-    (Join-Path $WorkspaceParent "Gen5WCAN\reference\HMG-API")
-) "HMG-API reference repository"
-
 $BuildDir = Join-Path $Root "build"
 $DistDir = Join-Path $Root "dist"
 $KeysDir = Join-Path $Root "keys"
@@ -91,6 +86,9 @@ function Copy-FileNormalizedLf([string]$Src, [string]$Dst) {
     Write-Utf8Lf $Dst $text
 }
 
+$UnixExecAttr = [int]0x81ED0000
+$UnixFileAttr = [int]0x81A40000
+
 function Create-ForwardSlashZip([string]$SourceDir, [string]$OutZip) {
     $outParent = Split-Path -Parent $OutZip
     if ($outParent -and !(Test-Path $outParent)) { New-Item -ItemType Directory -Force -Path $outParent | Out-Null }
@@ -103,6 +101,7 @@ function Create-ForwardSlashZip([string]$SourceDir, [string]$OutZip) {
         foreach ($f in $files) {
             $rel = $f.FullName.Substring($srcFull.Length + 1).Replace('\', '/')
             $entry = $zip.CreateEntry($rel, [System.IO.Compression.CompressionLevel]::Optimal)
+            $entry.ExternalAttributes = if ($rel.EndsWith(".sh")) { $UnixExecAttr } else { $UnixFileAttr }
             $entryStream = $entry.Open()
             $inStream = [System.IO.File]::OpenRead($f.FullName)
             try {
@@ -118,38 +117,45 @@ function Create-ForwardSlashZip([string]$SourceDir, [string]$OutZip) {
     }
 }
 
-# 1. Compile Shared Crypto/Protocol + HMG-API Client & Host Engine Tools
-$SharedClasses = Join-Path $BuildDir "shared-classes"
-$EngineClasses = Join-Path $BuildDir "hmgapi-engine"
-New-Item -ItemType Directory -Force -Path $SharedClasses, $EngineClasses | Out-Null
+function Read-ZipEntryAsciiText([string]$ZipPath, [string]$EntryName) {
+    $za = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        $e = $za.GetEntry($EntryName)
+        if ($null -eq $e) { throw "Missing $EntryName inside $ZipPath" }
+        $ms = New-Object System.IO.MemoryStream
+        $s = $e.Open()
+        try {
+            $s.CopyTo($ms)
+        } finally {
+            $s.Dispose()
+        }
+        return [System.Text.Encoding]::ASCII.GetString($ms.ToArray())
+    } finally {
+        $za.Dispose()
+    }
+}
 
-$HmgClientSrc = Join-Path $HmgApiRef "core\client\java\hmgapi\client\HmgApi.java"
+# 1. Compile Shared Crypto/Protocol (Zero HMG-API dependency)
+$SharedClasses = Join-Path $BuildDir "shared-classes"
+New-Item -ItemType Directory -Force -Path $SharedClasses | Out-Null
+
 $SharedSrcFiles = Get-ChildItem (Join-Path $Root "shared\java") -Recurse -Filter "*.java" |
     Select-Object -ExpandProperty FullName
 
 Invoke-Checked $Javac (@(
     "--release", "8", "-encoding", "UTF-8", "-Xlint:-options", "-nowarn",
     "-cp", $AndroidJar,
-    "-d", $SharedClasses,
-    $HmgClientSrc
-) + $SharedSrcFiles) "Compile Shared Crypto/Protocol + HmgApi client"
+    "-d", $SharedClasses
+) + $SharedSrcFiles) "Compile Shared Crypto & Protocol"
 
-$EngineSrcFiles = Get-ChildItem (Join-Path $HmgApiRef "core\runtime\java\hmgapi\engine") -Filter "*.java" |
-    Select-Object -ExpandProperty FullName
-Invoke-Checked $Javac (@(
-    "--release", "8", "-encoding", "UTF-8", "-Xlint:-options", "-nowarn",
-    "-cp", $AndroidJar,
-    "-d", $EngineClasses
-) + $EngineSrcFiles) "Compile HMG-API Engine tools"
-
-# 2. Ensure Dedicated Signing Keys Exist in gitignored keys/
+# 2. Ensure Dedicated APK Signing Keys Exist in gitignored keys/
 $CarKeystore = Join-Path $KeysDir "gen5w-digital-control-car.p12"
 if (!(Test-Path $CarKeystore)) {
     Invoke-Checked $Keytool @(
         "-genkeypair", "-keystore", $CarKeystore, "-storetype", "PKCS12",
         "-storepass", "gen5wdigitalctl", "-keypass", "gen5wdigitalctl",
         "-alias", "carapp", "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
-        "-dname", "CN=Gen5W Digital Control Car"
+        "-dname", "CN=Digital Control+ Car"
     ) "Generate dedicated Car APK keystore"
 }
 
@@ -159,23 +165,20 @@ if (!(Test-Path $PhoneKeystore)) {
         "-genkeypair", "-keystore", $PhoneKeystore, "-storetype", "PKCS12",
         "-storepass", "gen5wdigitalphone", "-keypass", "gen5wdigitalphone",
         "-alias", "phoneapp", "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
-        "-dname", "CN=Gen5W Digital Control Phone"
+        "-dname", "CN=Digital Control+ Phone"
     ) "Generate dedicated Phone APK keystore"
 }
 
-$AuthorKey = Join-Path $KeysDir "gen5w-digital-control-author.key"
-if (!(Test-Path $AuthorKey)) {
-    Invoke-Checked $Java @("-cp", $EngineClasses, "hmgapi.engine.Signing", "keygen", $AuthorKey) "Generate HMG-API ECDSA author key"
-}
+Write-Host "`n================ BUILDING DIGITAL CONTROL+ $Version (STANDALONE NEMESIS) ================" -ForegroundColor Yellow
 
-Write-Host "`n================ BUILDING DIGITAL CONTROL+ $Version ================" -ForegroundColor Yellow
+$NemStage = Join-Path $BuildDir "nemesis-stage"
+$NemAppDir = Join-Path $NemStage "app"
+$NemSvcDir = Join-Path $NemStage "svc"
+$NemBinDir = Join-Path $NemStage "bin"
+$NemScriptsDir = Join-Path $NemStage "scripts"
+New-Item -ItemType Directory -Force -Path $NemAppDir, $NemSvcDir, $NemBinDir, $NemScriptsDir | Out-Null
 
-$ModStage = Join-Path $BuildDir "mod-stage"
-$ModAppDir = Join-Path $ModStage "app"
-$ModSvcDir = Join-Path $ModStage "svc"
-New-Item -ItemType Directory -Force -Path $ModAppDir, $ModSvcDir | Out-Null
-
-# A. Build Root Service JAR (svc/digital-control-svc.jar)
+# A. Build Standalone Root Service JAR (svc/digital-control-svc.jar)
 $SvcClasses = Join-Path $BuildDir "svc-classes"
 New-Item -ItemType Directory -Force -Path $SvcClasses | Out-Null
 $SvcSrc = Get-ChildItem (Join-Path $Root "car-svc\src\common") -Recurse -Filter "*.java" | Select-Object -ExpandProperty FullName
@@ -188,7 +191,7 @@ Invoke-Checked $Javac (@(
 
 $SvcInputJar = Join-Path $BuildDir "svc-input.jar"
 Invoke-Checked $Jar @("cf", $SvcInputJar, "-C", $SvcClasses, ".", "-C", $SharedClasses, ".") "Bundle ControlDaemon jar"
-$OutSvcJar = Join-Path $ModSvcDir "digital-control-svc.jar"
+$OutSvcJar = Join-Path $NemSvcDir "digital-control-svc.jar"
 Invoke-Checked $Java @(
     "-Xmx1024M", "-jar", $D8Jar,
     "--release", "--min-api", "19",
@@ -250,7 +253,7 @@ try {
 }
 
 Invoke-Checked $ZipAlign @("-f", "4", $CarUnsigned, $CarAligned) "Zipalign Car APK"
-$OutCarApk = Join-Path $ModAppDir "Gen5WDigitalControl.apk"
+$OutCarApk = Join-Path $NemAppDir "Gen5WDigitalControl.apk"
 Invoke-Checked $Java @(
     "-Xmx1024M", "-jar", $ApkSignerJar,
     "sign", "--ks", $CarKeystore, "--ks-pass", "pass:gen5wdigitalctl",
@@ -259,44 +262,53 @@ Invoke-Checked $Java @(
     "--out", $OutCarApk, $CarAligned
 ) "Sign Car APK (v1 JAR scheme for KitKat)"
 
-# C. Sign HMG-API Mod & Wrap in NEMESIS USB Installer
-Copy-FileNormalizedLf (Join-Path $Root "mod\mod.json") (Join-Path $ModStage "mod.json")
-Copy-FileNormalizedLf (Join-Path $Root "mod\settings.json") (Join-Path $ModStage "settings.json")
-
-Invoke-Checked $Java @("-cp", $EngineClasses, "hmgapi.engine.Signing", "sign", $ModStage, $AuthorKey) "Sign HMG-API mod"
-Invoke-Checked $Java @("-cp", $EngineClasses, "hmgapi.engine.Signing", "verify", $ModStage) "Verify HMG-API mod signature"
-
-$ModZip = Join-Path $DistDir "$ModId-$Version.zip"
-Create-ForwardSlashZip $ModStage $ModZip
-
-$NemesisPkgId = "hmgapi.$ModId"
-$NemStage = Join-Path $BuildDir "nemesis-stage"
-$NemScripts = Join-Path $NemStage "scripts"
-$NemBin = Join-Path $NemStage "bin"
-$NemMod = Join-Path $NemStage "mod"
-New-Item -ItemType Directory -Force -Path $NemScripts, $NemBin, $NemMod | Out-Null
-
-$TemplateIn = [System.IO.File]::ReadAllText((Join-Path $HmgApiRef "install\nemesis\mod\NEMESIS.data.in"), [System.Text.Encoding]::UTF8)
-$Descriptor = $TemplateIn.
-    Replace("@PACKAGE_ID@", $NemesisPkgId).
-    Replace("@NAME@", $ModDisplayName).
-    Replace("@PACKAGE_VERSION@", $Version).
-    Replace("@SHORT_DESC@", "HMG-API mod: $ModDisplayName").
-    Replace("@DETAILED_DESC@", "$ModDisplayName $Version (needs HMG-API). Companion phone Bluetooth & optional self-hosted E2EE Wi-Fi car controls, Bluelink remote climate, AC Profiles, and EV preconditioning & charge monitor.").
-    Replace("@OS@", "any").
-    Replace("@DEPENDS@", "hmgapi@>=1.0")
+# C. Stage Standalone NEMESIS Package & USB Installer (No HMG-API)
+$TemplateIn = [System.IO.File]::ReadAllText((Join-Path $Root "mod\nemesis\NEMESIS.data.in"), [System.Text.Encoding]::UTF8)
+$Descriptor = $TemplateIn.Replace("@VERSION@", $Version)
 Write-Utf8Lf (Join-Path $NemStage "NEMESIS.data") $Descriptor
 
+Copy-FileNormalizedLf (Join-Path $Root "mod\nemesis\bin\open.sh") (Join-Path $NemBinDir "open.sh")
+Copy-FileNormalizedLf (Join-Path $Root "mod\nemesis\svc\digital-control-svc.sh") (Join-Path $NemSvcDir "digital-control-svc.sh")
 foreach ($s in @("preinstall.sh", "postinstall.sh", "preuninstall.sh")) {
-    Copy-FileNormalizedLf (Join-Path $HmgApiRef "install\nemesis\mod\scripts\$s") (Join-Path $NemScripts $s)
+    Copy-FileNormalizedLf (Join-Path $Root "mod\nemesis\scripts\$s") (Join-Path $NemScriptsDir $s)
 }
-Copy-FileNormalizedLf (Join-Path $Root "mod\nemesis\bin\open.sh") (Join-Path $NemBin "open.sh")
-Write-Utf8Lf (Join-Path $NemMod "id") "$ModId`n"
-Copy-Item $ModZip (Join-Path $NemMod "package.zip") -Force
 
-$UnitCmds = Join-Path $HmgApiRef "core\runtime\unit-commands.txt"
-$AllScripts = Get-ChildItem $NemStage -Recurse -Filter "*.sh" | Select-Object -ExpandProperty FullName
-Invoke-Checked $Java (@("-cp", $EngineClasses, "hmgapi.engine.ScriptCheck", $UnitCmds) + $AllScripts) "Check shell scripts for Gen5W mksh/toolbox"
+Write-Host "[Validate Standalone NEMESIS Package & Shell Scripts]" -ForegroundColor Cyan
+$NemDataText = [System.IO.File]::ReadAllText((Join-Path $NemStage "NEMESIS.data"), [System.Text.Encoding]::UTF8)
+if ($NemDataText -notmatch "(?m)^version=1\.1$" -or $NemDataText -notmatch "(?m)^id=$([regex]::Escape($NemesisPkgId))$") {
+    throw "NEMESIS.data missing expected version=1.1 or id=$NemesisPkgId"
+}
+if ($NemDataText -match "(?m)^depends=.*hmgapi") {
+    throw "NEMESIS.data must NOT declare an HMG-API dependency!"
+}
+if ($NemDataText -match '(?m)^short-desc="([^"]*)"$') {
+    if ($Matches[1].Length -gt 64) { throw "short-desc exceeds 64 chars ($($Matches[1].Length))" }
+}
+if ($NemDataText -match '(?m)^detailed-desc="([^"]*)"$') {
+    if ($Matches[1].Length -gt 256) { throw "detailed-desc exceeds 256 chars ($($Matches[1].Length))" }
+}
+foreach ($m in ([regex]::Matches($NemDataText, '(?m)^(?:preinstall|postinstall|preuninstall|path)=([^\r\n]+)$'))) {
+    $relPath = $m.Groups[1].Value.Trim()
+    if ($relPath.Contains("..")) { throw "NEMESIS.data contains forbidden '..' path: $relPath" }
+    $fullRef = Join-Path $NemStage ($relPath.Replace('/', '\'))
+    if (!(Test-Path $fullRef)) { throw "NEMESIS.data references missing file: $relPath" }
+}
+foreach ($sh in (Get-ChildItem $NemStage -Recurse -Filter "*.sh")) {
+    $shBytes = [System.IO.File]::ReadAllBytes($sh.FullName)
+    if ($shBytes -contains 13) { throw "CRLF found in $($sh.FullName)" }
+    $shText = [System.Text.Encoding]::UTF8.GetString($shBytes)
+    if (-not $shText.StartsWith("#!/system/bin/sh`n")) {
+        throw "Script must start with #!/system/bin/sh LF: $($sh.FullName)"
+    }
+    foreach ($line in ($shText -split "`n")) {
+        $trimmed = $line.Trim()
+        if ($trimmed -eq "" -or $trimmed.StartsWith("#")) { continue }
+        if ($trimmed -match '(?:^|[|;&`\(\s])(sed|awk|tr|head|tail|wc|cut|dirname|basename|find|stat)(?:\s|$|\|)') {
+            throw "Unavailable Android 4.4 toolbox command '$($Matches[1])' in $($sh.Name): $trimmed"
+        }
+    }
+    Write-Host "ok    $($sh.FullName)"
+}
 
 $NemesisPkgZip = Join-Path $DistDir "$ModId-$Version-nemesis-package.zip"
 Create-ForwardSlashZip $NemStage $NemesisPkgZip
@@ -307,12 +319,8 @@ New-Item -ItemType Directory -Force -Path $StickPkgs | Out-Null
 Copy-Item $NemesisPkgZip (Join-Path $StickPkgs "$NemesisPkgId.zip") -Force
 Write-Utf8Lf (Join-Path $StickStage "NEMESIS.data") "[nemesis]`nversion=1.0`ntype=install`npath=packages/$NemesisPkgId.zip`n"
 
-$ReadmeIn = [System.IO.File]::ReadAllText((Join-Path $HmgApiRef "install\nemesis\mod\README.txt"), [System.Text.Encoding]::UTF8)
-$ReadmeOut = $ReadmeIn.
-    Replace("@NAME@", $ModDisplayName).
-    Replace("@VERSION@", $Version).
-    Replace("@PACKAGE_ID@", $NemesisPkgId)
-Write-Utf8Lf (Join-Path $StickStage "README.txt") $ReadmeOut
+$ReadmeIn = [System.IO.File]::ReadAllText((Join-Path $Root "mod\nemesis\USB-README.txt"), [System.Text.Encoding]::UTF8)
+Write-Utf8Lf (Join-Path $StickStage "README.txt") ($ReadmeIn.Replace("@VERSION@", $Version))
 
 $NemesisUsbZip = Join-Path $DistDir "$ModId-$Version-nemesis.zip"
 Create-ForwardSlashZip $StickStage $NemesisUsbZip
@@ -379,7 +387,7 @@ Invoke-Checked $Java @(
 ) "Sign Android Phone APK (v1 + v2)"
 
 # E. Verification Checks
-Write-Host "[Verify Artifacts & Self-Hostable Defaults]" -ForegroundColor Cyan
+Write-Host "[Verify Artifacts, Standalone Independence & Self-Hostable Defaults]" -ForegroundColor Cyan
 $CarXml = & $Aapt dump xmltree $OutCarApk AndroidManifest.xml | Out-String
 if ($CarXml -notmatch "0x0101040f.*0xffffffff") {
     throw "Car APK missing android:disableSS=true (0x0101040f)"
@@ -389,53 +397,38 @@ if ($CarXml -notmatch "android\.permission\.INTERNET" -or $PhXml -notmatch "andr
     throw "Car/Phone APK missing INTERNET permission for optional self-hosted server!"
 }
 
+$SvcDexText = Read-ZipEntryAsciiText $OutSvcJar "classes.dex"
 $CarDexText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Join-Path $CarDex "classes.dex")))
 $PhDexText = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes((Join-Path $PhDex "classes.dex")))
 if ($CarDexText.Contains("ioniqthemes") -or $PhDexText.Contains("ioniqthemes")) {
     throw "Found hardcoded 'ioniqthemes' server URL in classes.dex — default server URL must be blank!"
 }
+foreach ($pair in @(
+    @("ControlDaemon", $SvcDexText),
+    @("Car APK", $CarDexText),
+    @("Phone APK", $PhDexText)
+)) {
+    if ($pair[1].Contains("hmgapi.client") -or $pair[1].Contains("Lhmgapi/")) {
+        throw "Found unexpected HMG-API class reference in $($pair[0]) classes.dex!"
+    }
+}
 if (-not ($CarDexText.Contains("CarRemoteRelayWorker") -and $PhDexText.Contains("PhoneRemoteClient"))) {
     throw "Missing E2EE remote relay client classes in unified build!"
 }
-Write-Host "ok  Verified unified build has E2EE relay support with blank/neutral default server URL"
+Write-Host "ok  Verified zero HMG-API class references and blank default remote server URL"
 
 Invoke-Checked $Java @("-Xmx512M", "-jar", $ApkSignerJar, "verify", "--min-sdk-version", "19", $OutCarApk) "Verify Car APK v1 signature"
 Invoke-Checked $Java @("-Xmx512M", "-jar", $ApkSignerJar, "verify", "--min-sdk-version", "24", $OutPhoneApk) "Verify Phone APK v1+v2 signature"
 
-foreach ($lfFile in (@(Get-ChildItem $NemStage -Recurse -Include "*.sh","NEMESIS.data","id") + @(Get-ChildItem $StickStage -Recurse -Include "NEMESIS.data","README.txt") + @(Get-ChildItem $ModStage -Filter "*.json"))) {
+foreach ($lfFile in (@(Get-ChildItem $NemStage -Recurse -Include "*.sh","NEMESIS.data") + @(Get-ChildItem $StickStage -Recurse -Include "NEMESIS.data","README.txt"))) {
     $bytes = [System.IO.File]::ReadAllBytes($lfFile.FullName)
     if ($bytes -contains 13) { throw "CRLF found in $($lfFile.FullName)" }
 }
 
-# Host simulation via HMG-API Engine
-$FakeRoot = Join-Path $BuildDir "host-sim"
-New-Item -ItemType Directory -Force -Path "$FakeRoot\data\hmgapi\mods", "$FakeRoot\system\etc\permissions" | Out-Null
-Write-Utf8Lf "$FakeRoot\props.txt" "ro.build.product=NEEV.USA.S5W_M.V015.012.260507`nro.build.version.release=4.4.2`nro.board.platform=tcc803x`n"
-$prevRoot = $env:HMGAPI_ROOT
-$prevHost = $env:HMGAPI_HOST
-$prevProd = $env:HMGAPI_PRODUCT
-try {
-    $env:HMGAPI_ROOT = $FakeRoot
-    $env:HMGAPI_HOST = "1"
-    $env:HMGAPI_PRODUCT = "NEEV.USA.S5W_M.V015.012.260507"
-    $instOut = & $Java -cp $EngineClasses hmgapi.engine.Engine install $ModZip 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) { throw "Engine host install failed:`n$instOut" }
-    $planOut = & $Java -cp $EngineClasses hmgapi.engine.Engine plan 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0 -or $planOut -match "(?m)^problem ") {
-        throw "Engine host plan reported problems:`n$planOut"
-    }
-    Write-Host "ok  HMG-API Engine host install & plan clean for NEEV.USA.S5W_M.V015.012.260507"
-} finally {
-    $env:HMGAPI_ROOT = $prevRoot
-    $env:HMGAPI_HOST = $prevHost
-    $env:HMGAPI_PRODUCT = $prevProd
-}
-
-# 3. Compile & Run Host JVM Crypto, E2EE, SAS-4, BLE Chunking, Key Backup, & TLS Test Suite
+# 3. Compile & Run Self-Contained Host JVM Crypto, E2EE, SAS-4, BLE Chunking, Key Backup, JSON & TLS Test Suite
 $HostTestClasses = Join-Path $BuildDir "host-test-classes"
 New-Item -ItemType Directory -Force -Path $HostTestClasses | Out-Null
 $HostTestSrc = @(
-    (Join-Path $HmgApiRef "core\runtime\java\hmgapi\engine\Json.java"),
     (Join-Path $Root "car-app\src\common\com\gen5w\digitalcontrol\edition\RemoteTlsHelper.java")
 ) + @(Get-ChildItem (Join-Path $Root "shared\java") -Recurse -Filter "*.java" | Select-Object -ExpandProperty FullName) `
   + @(Get-ChildItem (Join-Path $Root "tests\host") -Recurse -Filter "*.java" | Select-Object -ExpandProperty FullName)

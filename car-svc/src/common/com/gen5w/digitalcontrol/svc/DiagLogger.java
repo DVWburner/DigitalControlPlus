@@ -7,7 +7,7 @@ import java.util.Date;
 import java.util.Locale;
 
 /**
- * Bounded diagnostic event logger in HMGAPI_DATA (rotates automatically at 256 KB).
+ * Bounded diagnostic event logger in DIGITALCTL_DATA (/data/nemesis/digital-control, rotates automatically at 256 KB).
  */
 final class DiagLogger {
     private static final long MAX_LOG_BYTES = 256L * 1024L;

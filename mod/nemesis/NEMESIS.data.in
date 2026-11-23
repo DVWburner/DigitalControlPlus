@@ -1,0 +1,25 @@
+[nemesis]
+version=1.1
+id=gen5w.digitalcontrol
+name=Digital Control+
+type=application,service
+package-version=@VERSION@
+short-desc="Bluetooth & E2EE Wi-Fi phone car controls, AC Profiles & EV."
+detailed-desc="Digital Control+ @VERSION@ (standalone NEMESIS, no HMG-API required). Encrypted Android & iPhone Bluetooth + optional self-hosted E2EE Wi-Fi controls, Bluelink Ign-Off climate, AC Profiles, Utility Mode & EV preconditioning."
+os=any
+models=any
+preinstall=scripts/preinstall.sh
+postinstall=scripts/postinstall.sh
+preuninstall=scripts/preuninstall.sh
+
+[app.0]
+kind=sh
+path=bin/open.sh
+uid=root
+
+[service.0]
+name=digital-control-svc
+kind=sh
+path=svc/digital-control-svc.sh
+uid=root
+mode=restart

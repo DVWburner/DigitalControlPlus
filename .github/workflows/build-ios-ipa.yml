@@ -35,23 +35,23 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO
 
-      - name: Package DigitalControlPlus-1.0.0.ipa
+      - name: Package DigitalControlPlus-1.1.0.ipa
         run: |
           rm -rf Payload
           mkdir -p Payload
           cp -r build/Build/Products/Release-iphoneos/Gen5WDigitalControl.app Payload/
-          zip -r DigitalControlPlus-1.0.0.ipa Payload
+          zip -r DigitalControlPlus-1.1.0.ipa Payload
 
       - name: Upload DigitalControlPlus IPA Artifact
         uses: actions/upload-artifact@v4
         with:
           name: DigitalControlPlus-IPA
-          path: phone-ios/DigitalControlPlus-1.0.0.ipa
+          path: phone-ios/DigitalControlPlus-1.1.0.ipa
 
-      - name: Attach IPA to GitHub Release v1.0.0 (if present)
+      - name: Attach IPA to GitHub Release v1.1.0 (if present)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if gh release view v1.0.0 >/dev/null 2>&1; then
-            gh release upload v1.0.0 DigitalControlPlus-1.0.0.ipa --clobber
+          if gh release view v1.1.0 >/dev/null 2>&1; then
+            gh release upload v1.1.0 DigitalControlPlus-1.1.0.ipa --clobber
           fi

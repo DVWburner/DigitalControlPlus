@@ -1,7 +1,5 @@
 package org.json;
 
-import hmgapi.engine.Json;
-
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -15,7 +13,7 @@ public class JSONArray {
 
     public JSONArray(String json) throws JSONException {
         try {
-            Object p = Json.parse(json);
+            Object p = SimpleJsonCodec.parse(json);
             if (!(p instanceof List)) throw new JSONException("Not a JSON array");
             @SuppressWarnings("unchecked")
             List<Object> l = (List<Object>) p;
@@ -60,6 +58,6 @@ public class JSONArray {
 
     @Override
     public String toString() {
-        return Json.write(list);
+        return SimpleJsonCodec.write(list);
     }
 }

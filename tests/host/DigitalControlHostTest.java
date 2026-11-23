@@ -33,7 +33,8 @@ public final class DigitalControlHostTest {
         testKeyBackupExportAndImport();
         testCommandLogAndTpmsSensors();
         testUrlNormalizationAndBatteryPrecond();
-        System.out.println("ok  All 10 DigitalControlHostTest suites passed!");
+        testSimpleJsonCodecRoundTrip();
+        System.out.println("ok  All 11 DigitalControlHostTest suites passed!");
     }
 
     private static void testKeyEncodingAndEcdsa() throws Exception {
@@ -344,6 +345,20 @@ public final class DigitalControlHostTest {
         assertTrue(!snapUtilRefused.isUtilityModeActive(), "Expected Utility Mode inactive when hv.utility_mode=1");
         assertTrue("OFF (Conditions Not Met)".equals(snapUtilRefused.formatUtilityModeStatus()), "Expected OFF (Conditions Not Met)");
         assertTrue("NOT READY (IG OFF/ACC)".equals(snapUtilRefused.formatEvReadyStatus()), "Expected NOT READY (IG OFF/ACC)");
+    }
+
+    private static void testSimpleJsonCodecRoundTrip() throws Exception {
+        String raw = "{\"title\":\"Temp 70\\u00B0F\",\"neg\":-12,\"dec\":94.5,\"ok\":true,\"arr\":[{\"k\":\"v\"},42,false,null]}";
+        JSONObject obj = new JSONObject(raw);
+        assertTrue("Temp 70\u00B0F".equals(obj.getString("title")), "Unicode escape decode failed");
+        assertTrue(obj.optLong("neg", 0L) == -12L, "Negative long mismatch");
+        assertTrue(obj.optBoolean("ok", false), "Boolean mismatch");
+        assertTrue(obj.has("dec"), "Expected has(\"dec\") true");
+        obj.remove("dec");
+        assertTrue(!obj.has("dec"), "Expected remove(\"dec\") to remove key");
+
+        JSONObject reparsed = new JSONObject(obj.toString());
+        assertTrue("v".equals(reparsed.optJSONArray("arr").optJSONObject(0).getString("k")), "Nested array object roundtrip failed");
     }
 
     private static void assertTrue(boolean cond, String msg) {

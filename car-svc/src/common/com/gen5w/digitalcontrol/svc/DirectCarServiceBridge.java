@@ -7,8 +7,6 @@ import android.os.RemoteException;
 
 import com.gen5w.digitalcontrol.shared.ClimateTheme;
 
-import hmgapi.client.HmgApi;
-
 import org.json.JSONObject;
 
 import java.io.File;
@@ -113,6 +111,9 @@ final class DirectCarServiceBridge {
     private volatile Integer cachedHevBattCondFlag = null;
     private volatile Integer cachedHevUtilModeFlag = null;
     private volatile Integer cachedHevUtilWarnFlag = null;
+    private volatile Integer cachedHevDisplaySocFlag = null;
+    private volatile Integer cachedHevOdometerFlag = null;
+    private volatile long lastChargeDoorMonoMs = 0L;
 
     private IBinder registeredBcmService;
     private IBinder bcmListenerToken;
@@ -239,13 +240,27 @@ final class DirectCarServiceBridge {
         if (rangeKm != null && rangeKm >= 0 && rangeKm < 2500) {
             out.put("hv.range", String.valueOf(rangeKm));
         }
-        Float soc = callNumericNoArgAsFloat(SVC_HSCAN, IFACE_HSCAN, "remainBatteryPercentage", true);
-        if (soc != null && !Float.isNaN(soc) && soc >= 0f && soc <= 100f) {
-            out.put("hv.soc", formatCompactFloat(soc));
+        Integer dispSocHalf = pollHevDisplaySoc();
+        if (dispSocHalf != null && dispSocHalf >= 0 && dispSocHalf <= 200) {
+            out.put("hv.soc", formatCompactFloat(dispSocHalf / 2f));
+        } else {
+            Float soc = callNumericNoArgAsFloat(SVC_HSCAN, IFACE_HSCAN, "remainBatteryPercentage", true);
+            if (soc != null && !Float.isNaN(soc) && soc >= 0f && soc <= 100f) {
+                out.put("hv.soc", formatCompactFloat(soc));
+            }
         }
-        Float odo = callFloatArgByte(SVC_HSCAN, IFACE_HSCAN, "getOdometer", (byte) 0, true);
-        if (odo != null && !Float.isNaN(odo) && odo > 0f) {
-            out.put("odometer", formatCompactFloat(odo));
+        Integer hevOdoTenths = pollHevOdometerTenths();
+        if (hevOdoTenths != null && hevOdoTenths > 0 && hevOdoTenths != 0xFFFF) {
+            out.put("odometer", formatCompactFloat(hevOdoTenths / 10f));
+        } else {
+            Float odo = callFloatArgByte(SVC_HSCAN, IFACE_HSCAN, "getOdometer", (byte) 0, true);
+            if (odo != null && !Float.isNaN(odo) && odo > 0f) {
+                out.put("odometer", formatCompactFloat(odo));
+            }
+        }
+        Integer soh = callIntNoArg(SVC_HSCAN, IFACE_HSCAN, "getXEV_Bms_GDS_SOH", true);
+        if (soh != null && soh >= 0 && soh <= 255) {
+            out.put("hv.health", String.valueOf(soh));
         }
         Integer aux = callIntNoArg(SVC_HSCAN, IFACE_HSCAN, "getBatSoc", true);
         if (aux != null && aux > 0 && aux <= 100) {
@@ -950,26 +965,11 @@ final class DirectCarServiceBridge {
             boolean wantActive = "precondition_on".equals(cmd)
                     || ("precondition_toggle".equals(cmd) && !curActive);
             if (!wantActive) {
-                boolean wasDirect = directCondActive;
                 stopDirectBatteryConditioning();
                 snap.put("conditioning.state", "off");
-                try {
-                    String reply = HmgApi.connect().timeout(1200).command("conditioning", "stop");
-                    return new CommandReply(true, wasDirect ? "Battery Preconditioning Stopped" : reply);
-                } catch (Throwable err) {
-                    return new CommandReply(true, "Battery Preconditioning Stopped");
-                }
+                return new CommandReply(true, "Battery Preconditioning Stopped");
             }
-            // Try HMG-API first (with "warm" flag to avoid 70°F block); if HMG-API refuses
-            // (e.g. "refused: the car isn't READY" while in Utility Mode), bypass directly via IHEVService!
-            try {
-                String reply = HmgApi.connect().timeout(1200).command("conditioning", "start", "warm");
-                directCondActive = false;
-                directCondTerminalState = null;
-                return new CommandReply(true, reply);
-            } catch (Throwable hmgErr) {
-                return startDirectBatteryConditioning(snap, hmgErr.getMessage());
-            }
+            return startDirectBatteryConditioning(snap, null);
         }
         if ("charge_door_open".equals(cmd) || "charge_door_close".equals(cmd) || "charge_door_toggle".equals(cmd)) {
             boolean currentlyOpen = "1".equals(snap.get("charge_door.open")) || bcmCdmState == 1;
@@ -978,15 +978,19 @@ final class DirectCarServiceBridge {
             if ("0".equals(snap.get("gear.park"))) {
                 return new CommandReply(false, "Refused: Car must be in PARK");
             }
-            try {
-                String reply = HmgApi.connect().timeout(1200).command("charge_door", open ? "open" : "close");
-                bcmCdmState = open ? 1 : 2;
-                return new CommandReply(true, reply);
-            } catch (Throwable hmgErr) {
-                boolean ok = callBoolWrite1(SVC_BCM, IFACE_BCM, "requestChargeLockDoor", !open);
-                if (ok) bcmCdmState = open ? 1 : 2;
-                return new CommandReply(ok, ok ? ("Charge Port " + (open ? "OPEN" : "CLOSE")) : String.valueOf(hmgErr.getMessage()));
+            long nowMono = System.nanoTime() / 1_000_000L;
+            if (lastChargeDoorMonoMs > 0L && (nowMono - lastChargeDoorMonoMs) < 2000L) {
+                return new CommandReply(false, "Refused: Wait 2s between charge door commands");
             }
+            boolean ok = callBoolWrite1(SVC_BCM, IFACE_BCM, "requestChargeLockDoor", !open);
+            if (ok) {
+                lastChargeDoorMonoMs = nowMono;
+                bcmCdmState = open ? 1 : 2;
+                snap.put("charge_door.open", open ? "1" : "0");
+            }
+            return new CommandReply(ok, ok
+                    ? ("Charge Port " + (open ? "OPEN" : "CLOSE"))
+                    : "BCM requestChargeLockDoor unavailable");
         }
 
         // --- EV Utility Mode & Ignition-Off TMU Climate (Testing Controls) ---
@@ -1230,19 +1234,12 @@ final class DirectCarServiceBridge {
                 if (snap != null) snap.put("wheel_heat", wantOn ? "1" : "0");
             }
         }
-        CommandReply hmg = tryHmgCommandChecked("wheel_heat", wantOn ? "on" : "off");
-        if (hmg != null) {
-            if (hmg.ok) {
-                bcmWheelHeat = wantOn ? 1 : 0;
-                return new CommandReply(true, "Steering Wheel Heat " + (wantOn ? "ON" : "OFF"));
-            }
-            if (bcmOk) {
-                return new CommandReply(true, "Steering Wheel Heat " + (wantOn ? "ON" : "OFF"));
-            }
-            return hmg;
+        boolean vrOk = callIntWrite1(SVC_VR, IFACE_VR, "set_StrgWhlHeated_Cmd_AVN", wantOn ? 1 : 0);
+        boolean ok = vrOk || bcmOk;
+        if (ok) {
+            bcmWheelHeat = wantOn ? 1 : 0;
+            if (snap != null) snap.put("wheel_heat", wantOn ? "1" : "0");
         }
-        boolean ok = callIntWrite1(SVC_VR, IFACE_VR, "set_StrgWhlHeated_Cmd_AVN", wantOn ? 1 : 0) || bcmOk;
-        if (ok) bcmWheelHeat = wantOn ? 1 : 0;
         return new CommandReply(ok, ok ? ("Steering Wheel Heat " + (wantOn ? "ON" : "OFF")) : "Wheel heat unavailable");
     }
 
@@ -1437,6 +1434,9 @@ final class DirectCarServiceBridge {
     }
 
     private CommandReply setSeatClimate(String seatName, boolean heat, int level, boolean twoStep, Map<String, String> snap) {
+        if (!heat && seatName != null && seatName.startsWith("rear")) {
+            return new CommandReply(false, "Rear seats have no ventilation");
+        }
         int clamped = Math.max(0, Math.min(twoStep && heat ? 2 : 3, level));
         String levelWord = clamped == 0 ? "off"
                 : (twoStep && heat ? (clamped == 1 ? "low" : "high")
@@ -1451,33 +1451,14 @@ final class DirectCarServiceBridge {
             bcmOk = applyBcmSingleSeatOp(seatName, usmCode);
         }
 
-        CommandReply hmg = tryHmgCommandChecked(heat ? "seat_heat" : "seat_vent", seatName, levelWord);
-        if (hmg != null) {
-            if (hmg.ok || bcmOk) {
-                return new CommandReply(true, prettySeat + (heat ? "Heat -> " : "Vent -> ") + levelWord.toUpperCase(Locale.US));
-            }
-            return hmg;
-        }
         String usmMethod = "driver".equals(seatName) ? "setFrontSeatHeatDrvStep"
                 : ("passenger".equals(seatName) ? "setFrontSeatHeatAstStep"
                 : ("rear_left".equals(seatName) ? "setRearSeatHeatLeftStep" : "setRearSeatHeatRightStep"));
-        boolean ok = callIntWrite1(SVC_USM, IFACE_USM, usmMethod, usmCode) || bcmOk;
+        boolean usmOk = callIntWrite1(SVC_USM, IFACE_USM, usmMethod, usmCode);
+        boolean ok = usmOk || bcmOk;
         return new CommandReply(ok, ok
                 ? (prettySeat + (heat ? "Heat -> " : "Vent -> ") + levelWord.toUpperCase(Locale.US))
                 : "Seat command unavailable");
-    }
-
-    private CommandReply tryHmgCommandChecked(String name, String... args) {
-        try {
-            String res = HmgApi.connect().timeout(1200).command(name, args);
-            return new CommandReply(true, res);
-        } catch (Throwable err) {
-            String msg = err.getMessage();
-            if (msg != null && msg.trim().toLowerCase(Locale.US).startsWith("refused:")) {
-                return new CommandReply(false, msg.trim());
-            }
-            return null;
-        }
     }
 
     private synchronized void ensureBcmListenerRegistered() {
@@ -1746,11 +1727,31 @@ final class DirectCarServiceBridge {
     private Integer pollHevBattConditioningSetting() {
         try {
             if (cachedHevBattCondFlag == null) {
-                Class<?> flagCls = Class.forName("com.hkmc.hev.HEVManager$HEVFlag", false, getInterfaceLoader(false));
-                Field f = flagCls.getField("EV_BATTERYCONDITIONING");
-                cachedHevBattCondFlag = Integer.valueOf(f.getInt(null));
+                cachedHevBattCondFlag = Integer.valueOf(resolveHevFlagField("EV_BATTERYCONDITIONING", 0x5e));
             }
             return callIntArgInt(SVC_HEV, IFACE_HEV, "getHEVStatus", cachedHevBattCondFlag.intValue(), false);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private Integer pollHevDisplaySoc() {
+        try {
+            if (cachedHevDisplaySocFlag == null) {
+                cachedHevDisplaySocFlag = Integer.valueOf(resolveHevFlagField("DISPLAY_SOC", 0x19));
+            }
+            return callIntArgInt(SVC_HEV, IFACE_HEV, "getHEVStatus", cachedHevDisplaySocFlag.intValue(), false);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private Integer pollHevOdometerTenths() {
+        try {
+            if (cachedHevOdometerFlag == null) {
+                cachedHevOdometerFlag = Integer.valueOf(resolveHevFlagField("ODOMETER", 0x1f));
+            }
+            return callIntArgInt(SVC_HEV, IFACE_HEV, "getHEVStatus", cachedHevOdometerFlag.intValue(), false);
         } catch (Throwable ignored) {
             return null;
         }
@@ -2082,7 +2083,7 @@ final class DirectCarServiceBridge {
         directCondStartMs = now;
         lastDirectCondKeepMs = now;
         snap.put("conditioning.state", "waiting");
-        return new CommandReply(true, "Preconditioning Sent (Direct HEV Bypass \u00B7 9km/18m)");
+        return new CommandReply(true, "Battery Preconditioning Started (9km/18m)");
     }
 
     private void stopDirectBatteryConditioning() {

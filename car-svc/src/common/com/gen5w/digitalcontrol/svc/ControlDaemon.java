@@ -7,8 +7,6 @@ import android.os.SystemClock;
 
 import com.gen5w.digitalcontrol.shared.ProtocolFrames;
 
-import hmgapi.client.HmgApi;
-
 import org.json.JSONObject;
 
 import java.io.File;
@@ -17,7 +15,6 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.lang.reflect.Method;
-import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.Callable;
@@ -32,10 +29,10 @@ import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
- * Root Dalvik service started by hmgapid (user=root, start=android, restart=true).
+ * Standalone root Dalvik service started by NEMESIS svcmgr (uid=root, mode=restart).
  * Responsibilities:
  *  1. Exposes UID-verified LocalServerSocket IPC to the companion in-car APK (CarLinkService & MainActivity).
- *  2. Polls Gen5W direct Binder + HMG-API vehicle readings on demand and while active.
+ *  2. Polls Gen5W direct Binder vehicle readings on demand and while active.
  *  3. Executes vehicle controls and multi-step Climate Theme macros safely with timeout isolation.
  *  4. Keeps CarLinkService running in the background while the head unit is on (e.g., while charging in driveway).
  *  5. Tracks APK firstInstallTime and purges any service-side state if the app was removed and re-installed.
@@ -50,18 +47,19 @@ public final class ControlDaemon {
     private final File dataDir;
     private final File modDir;
     private final PmHelper pmHelper = new PmHelper();
-    private final VehicleQueryClient hmgClient = new VehicleQueryClient();
     private final DirectCarServiceBridge directCar = new DirectCarServiceBridge();
 
     private final Object pollWakeLock = new Object();
     private final Object snapLock = new Object();
-    private final Map<String, String> hmgValues = new LinkedHashMap<String, String>();
     private final Map<String, String> directValues = new LinkedHashMap<String, String>();
     private final Map<String, String> mergedValues = new LinkedHashMap<String, String>();
     private volatile JSONObject cachedVehicleJson;
     private volatile long lastDemandElapsedMs = 0L;
     private volatile boolean running = true;
     private volatile LocalServerSocket serverSocket;
+    private volatile long settingsLastModMs = -1L;
+    private volatile boolean cachedAllowBt = true;
+    private volatile boolean cachedShowToast = true;
 
     private final ExecutorService ipcPool = new ThreadPoolExecutor(
             2, 6, 30L, TimeUnit.SECONDS,
@@ -91,12 +89,15 @@ public final class ControlDaemon {
     }
 
     public static void main(String[] args) {
-        String dataPath = System.getenv("HMGAPI_DATA");
+        String dataPath = System.getenv("DIGITALCTL_DATA");
         if (dataPath == null || dataPath.trim().isEmpty()) {
-            dataPath = "/data/hmgapi/data/" + SvcEditionConfig.MOD_ID;
+            dataPath = SvcEditionConfig.DEFAULT_DATA_DIR;
         }
-        String modDirPath = System.getenv("HMGAPI_MOD_DIR");
-        File modDir = modDirPath == null ? null : new File(modDirPath);
+        String modDirPath = System.getenv("DIGITALCTL_MOD_DIR");
+        if (modDirPath == null || modDirPath.trim().isEmpty()) {
+            modDirPath = SvcEditionConfig.DEFAULT_MOD_DIR;
+        }
+        File modDir = new File(modDirPath);
         ControlDaemon daemon = new ControlDaemon(new File(dataPath), modDir);
         daemon.run();
     }
@@ -111,6 +112,8 @@ public final class ControlDaemon {
         DiagLogger.logEvent("DAEMON-START", "mod=" + SvcEditionConfig.MOD_ID
                 + " pkg=" + SvcEditionConfig.APP_PACKAGE
                 + " remoteEdition=" + SvcEditionConfig.REMOTE_EDITION);
+
+        cleanupLegacyHmgApiState();
 
         Runtime.getRuntime().addShutdownHook(new Thread("digctl-shutdown") {
             @Override
@@ -139,6 +142,7 @@ public final class ControlDaemon {
         if (isModDisabled()) return;
         if (!"1".equals(pmHelper.getSystemProp("sys.boot_completed", "0"))) return;
 
+        pmHelper.ensurePackageEnabled(SvcEditionConfig.APP_PACKAGE);
         long currentFirstInstall = pmHelper.getPackageFirstInstallTime(SvcEditionConfig.APP_PACKAGE);
         if (currentFirstInstall <= 0L) {
             return;
@@ -165,9 +169,19 @@ public final class ControlDaemon {
             @Override
             public void run() {
                 try {
+                    for (int i = 0; i < 30 && running; i++) {
+                        if ("1".equals(pmHelper.getSystemProp("sys.boot_completed", "0"))) {
+                            break;
+                        }
+                        Thread.sleep(2000L);
+                    }
+                    if (!running || !"1".equals(pmHelper.getSystemProp("sys.boot_completed", "0"))) {
+                        return;
+                    }
+                    pmHelper.ensurePackageEnabled(SvcEditionConfig.APP_PACKAGE);
                     int installed = pmHelper.getPackageVersionCode(SvcEditionConfig.APP_PACKAGE);
-                    if (installed >= 0 && installed < SvcEditionConfig.EXPECTED_APP_VERSION_CODE) {
-                        DiagLogger.logEvent("APK-SYNC", "Updating APK " + installed
+                    if (installed < SvcEditionConfig.EXPECTED_APP_VERSION_CODE) {
+                        DiagLogger.logEvent("APK-SYNC", "Installing/Updating APK " + installed
                                 + " -> " + SvcEditionConfig.EXPECTED_APP_VERSION_CODE);
                         pmHelper.installApkReplace(apk);
                     }
@@ -180,33 +194,6 @@ public final class ControlDaemon {
     }
 
     private void startTelemetryThreads() {
-        Thread hmgThread = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                while (running) {
-                    try {
-                        VehicleQueryClient.BatchResult res = hmgClient.query(Arrays.asList(VehicleQueryClient.CORE_KEYS));
-                        if (res.anySuccess && !res.values.isEmpty()) {
-                            synchronized (snapLock) {
-                                hmgValues.putAll(res.values);
-                                rebuildCachedJsonLocked();
-                            }
-                        }
-                    } catch (Throwable ignored) {
-                    }
-                    long now = SystemClock.elapsedRealtime();
-                    long sleep = (now - lastDemandElapsedMs) <= DEMAND_WINDOW_MS ? 1500L : 5000L;
-                    try {
-                        Thread.sleep(sleep);
-                    } catch (InterruptedException ignored) {
-                        break;
-                    }
-                }
-            }
-        }, "digctl-hmg-poll");
-        hmgThread.setDaemon(true);
-        hmgThread.start();
-
         Thread binderThread = new Thread(new Runnable() {
             @Override
             public void run() {
@@ -247,19 +234,10 @@ public final class ControlDaemon {
 
     private void rebuildCachedJsonLocked() {
         mergedValues.clear();
-        for (Map.Entry<String, String> e : hmgValues.entrySet()) {
-            if (isNonEmptyReading(e.getValue())) {
-                mergedValues.put(e.getKey(), e.getValue());
-            }
-        }
         for (Map.Entry<String, String> e : directValues.entrySet()) {
-            String k = e.getKey();
             String v = e.getValue();
             if (!isNonEmptyReading(v)) continue;
-            if (("hv.soc".equals(k) || "odometer".equals(k)) && isNonEmptyReading(mergedValues.get(k))) {
-                continue;
-            }
-            mergedValues.put(k, v);
+            mergedValues.put(e.getKey(), v);
         }
         try {
             JSONObject vals = new JSONObject();
@@ -375,7 +353,7 @@ public final class ControlDaemon {
             if ("bt".equals(source) && !isBluetoothControlAllowed()) {
                 JSONObject denied = new JSONObject();
                 denied.put("ok", false);
-                denied.put("message", "Refused: Bluetooth control is turned OFF in HMG-API settings");
+                denied.put("message", "Refused: Bluetooth control is turned OFF in daemon settings");
                 return denied;
             }
             return executeVehicleCommandBounded(action, arg, source);
@@ -441,21 +419,122 @@ public final class ControlDaemon {
         return modDir != null && new File(modDir, ".disabled").exists();
     }
 
-    private boolean isBluetoothControlAllowed() {
+    private void refreshDaemonSettingsIfNeeded() {
+        File cfg = new File(dataDir, "settings.json");
+        if (!cfg.isFile()) {
+            if (settingsLastModMs != -1L) {
+                settingsLastModMs = -1L;
+                cachedAllowBt = true;
+                cachedShowToast = true;
+            }
+            return;
+        }
+        long lm = cfg.lastModified();
+        if (lm == settingsLastModMs) return;
         try {
-            JSONObject s = HmgApi.connect().timeout(500).settings();
-            return s == null || s.optBoolean("allow_bluetooth_control", true);
+            String raw = readUtf8Small(cfg, 8192);
+            JSONObject j = new JSONObject(raw);
+            cachedAllowBt = j.optBoolean("allow_bluetooth_control", true);
+            cachedShowToast = j.optBoolean("show_command_toasts", true);
+            settingsLastModMs = lm;
         } catch (Throwable ignored) {
-            return true;
         }
     }
 
+    private boolean isBluetoothControlAllowed() {
+        refreshDaemonSettingsIfNeeded();
+        return cachedAllowBt;
+    }
+
     private boolean shouldShowCommandToast() {
+        refreshDaemonSettingsIfNeeded();
+        return cachedShowToast;
+    }
+
+    private void cleanupLegacyHmgApiState() {
         try {
-            JSONObject s = HmgApi.connect().timeout(500).settings();
-            return s == null || s.optBoolean("show_command_toasts", true);
+            File appsJson = new File("/data/hmgapi/state/apps.json");
+            if (appsJson.isFile()) {
+                String raw = readUtf8Small(appsJson, 32768);
+                if (raw != null && raw.contains(SvcEditionConfig.APP_PACKAGE)) {
+                    JSONObject obj = new JSONObject(raw);
+                    if (obj.has(SvcEditionConfig.APP_PACKAGE)) {
+                        obj.remove(SvcEditionConfig.APP_PACKAGE);
+                        writeUtf8Small(appsJson, obj.toString());
+                        DiagLogger.logEvent("MIGRATE", "Removed legacy HMG-API apps.json entry");
+                    }
+                }
+            }
         } catch (Throwable ignored) {
-            return true;
+        }
+        try {
+            File appsInst = new File("/data/hmgapi/state/apps.installed");
+            if (appsInst.isFile()) {
+                String raw = readUtf8Small(appsInst, 16384);
+                if (raw != null && raw.contains(SvcEditionConfig.APP_PACKAGE)) {
+                    StringBuilder kept = new StringBuilder();
+                    for (String line : raw.split("\\r?\\n")) {
+                        String trimmed = line.trim();
+                        if (!trimmed.isEmpty() && !SvcEditionConfig.APP_PACKAGE.equals(trimmed)) {
+                            kept.append(trimmed).append('\n');
+                        }
+                    }
+                    writeUtf8Small(appsInst, kept.toString());
+                    DiagLogger.logEvent("MIGRATE", "Removed legacy HMG-API apps.installed entry");
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            File legacyMod = new File("/data/hmgapi/mods/" + SvcEditionConfig.LEGACY_HMGAPI_MOD_ID);
+            File legacySettings = new File("/data/hmgapi/settings/" + SvcEditionConfig.LEGACY_HMGAPI_MOD_ID + ".json");
+            boolean hadLegacy = legacyMod.exists() || legacySettings.exists();
+            if (legacyMod.exists()) deleteTree(legacyMod);
+            if (legacySettings.exists()) legacySettings.delete();
+            if (hadLegacy) {
+                DiagLogger.logEvent("MIGRATE", "Cleaned up legacy HMG-API mod directory");
+                File hmgapid = new File("/system/bin/hmgapid");
+                if (hmgapid.isFile() && hmgapid.canExecute()) {
+                    PmHelper.runCommandCapture(new String[] { "/system/bin/hmgapid", "engine", "apply" }, 10000L);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void deleteTree(File f) {
+        if (f == null || !f.exists()) return;
+        File[] kids = f.listFiles();
+        if (kids != null) {
+            for (File k : kids) {
+                deleteTree(k);
+            }
+        }
+        f.delete();
+    }
+
+    private static String readUtf8Small(File f, int maxBytes) throws IOException {
+        FileInputStream fis = new FileInputStream(f);
+        try {
+            byte[] buf = new byte[Math.min(maxBytes, (int) Math.max(128L, Math.min(maxBytes, f.length())))];
+            int total = 0;
+            while (total < buf.length) {
+                int r = fis.read(buf, total, buf.length - total);
+                if (r <= 0) break;
+                total += r;
+            }
+            return new String(buf, 0, total, "UTF-8");
+        } finally {
+            fis.close();
+        }
+    }
+
+    private static void writeUtf8Small(File f, String content) throws IOException {
+        FileOutputStream fos = new FileOutputStream(f, false);
+        try {
+            fos.write(content.getBytes("UTF-8"));
+        } finally {
+            fos.close();
         }
     }
 

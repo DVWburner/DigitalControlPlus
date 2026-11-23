@@ -19,6 +19,7 @@ final class PmHelper {
     private Object pm;
     private Method mGetPackageInfo;
     private Method mGetPackageUid;
+    private Method mGetAppEnabledSetting;
 
     static final class CommandResult {
         final int exitCode;
@@ -43,6 +44,7 @@ final class PmHelper {
         Class<?> ipm = Class.forName("android.content.pm.IPackageManager");
         mGetPackageInfo = ipm.getMethod("getPackageInfo", String.class, int.class, int.class);
         mGetPackageUid = ipm.getMethod("getPackageUid", String.class, int.class);
+        mGetAppEnabledSetting = ipm.getMethod("getApplicationEnabledSetting", String.class, int.class);
         return pm;
     }
 
@@ -76,12 +78,83 @@ final class PmHelper {
         return pi == null ? -1L : pi.firstInstallTime;
     }
 
+    void ensurePackageEnabled(String pkg) {
+        try {
+            Object s = ensurePm();
+            Object stObj = mGetAppEnabledSetting.invoke(s, pkg, USER_OWNER);
+            int state = stObj instanceof Integer ? ((Integer) stObj).intValue() : 0;
+            // PackageManager.COMPONENT_ENABLED_STATE_DISABLED (2) or DISABLED_USER (3)
+            if (state == 2 || state == 3) {
+                runCommandCapture(new String[] { "/system/bin/pm", "enable", pkg }, 4000L);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
     boolean installApkReplace(File apkFile) {
         if (apkFile == null || !apkFile.isFile()) return false;
-        CommandResult res = runCommandCapture(new String[] {
-                "/system/bin/pm", "install", "-r", apkFile.getAbsolutePath()
-        }, 30000L);
-        return res.exitCode == 0 && (res.output.contains("Success") || !res.output.contains("Failure"));
+        File tmpApk = new File("/data/local/tmp/Gen5WDigitalControl.apk");
+        try {
+            copyFileWorldReadable(apkFile, tmpApk);
+            String prevBoot = getSystemProp("sys.boot_completed", "1");
+            boolean cleared = false;
+            if ("1".equals(prevBoot)) {
+                CommandResult sp = runCommandCapture(new String[] { "/system/bin/setprop", "sys.boot_completed", "0" }, 1500L);
+                cleared = sp.exitCode == 0;
+            }
+            try {
+                CommandResult res = runCommandCapture(new String[] {
+                        "/system/bin/pm", "install", "-r", tmpApk.getAbsolutePath()
+                }, 30000L);
+                boolean ok = res.output.contains("Success");
+                if (!ok && res.output.contains("INCONSISTENT_CERTIFICATES")) {
+                    CommandResult pathRes = runCommandCapture(new String[] {
+                            "/system/bin/pm", "path", SvcEditionConfig.APP_PACKAGE
+                    }, 3000L);
+                    if (pathRes.output.contains("package:")) {
+                        runCommandCapture(new String[] {
+                                "/system/bin/pm", "uninstall", SvcEditionConfig.APP_PACKAGE
+                        }, 15000L);
+                        res = runCommandCapture(new String[] {
+                                "/system/bin/pm", "install", "-r", tmpApk.getAbsolutePath()
+                        }, 30000L);
+                        ok = res.output.contains("Success");
+                    }
+                }
+                if (ok) {
+                    runCommandCapture(new String[] { "/system/bin/pm", "enable", SvcEditionConfig.APP_PACKAGE }, 4000L);
+                }
+                return ok;
+            } finally {
+                if (cleared) {
+                    runCommandCapture(new String[] { "/system/bin/setprop", "sys.boot_completed", prevBoot }, 1500L);
+                }
+            }
+        } finally {
+            tmpApk.delete();
+        }
+    }
+
+    private static void copyFileWorldReadable(File src, File dst) {
+        java.io.FileInputStream in = null;
+        java.io.FileOutputStream out = null;
+        try {
+            File parent = dst.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            in = new java.io.FileInputStream(src);
+            out = new java.io.FileOutputStream(dst, false);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            out.flush();
+        } catch (Throwable ignored) {
+        } finally {
+            closeQuietly(in);
+            closeQuietly(out);
+            dst.setReadable(true, false);
+        }
     }
 
     void ensureLinkServiceStarted(String appPackage) {

@@ -1,7 +1,5 @@
 package org.json;
 
-import hmgapi.engine.Json;
-
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -17,7 +15,7 @@ public class JSONObject {
 
     public JSONObject(String json) throws JSONException {
         try {
-            this.map = Json.object(json);
+            this.map = SimpleJsonCodec.parseObject(json);
         } catch (Throwable t) {
             throw new JSONException("Invalid JSON object: " + t.getMessage(), t);
         }
@@ -128,8 +126,16 @@ public class JSONObject {
         return null;
     }
 
+    public boolean has(String name) {
+        return map.containsKey(name);
+    }
+
+    public Object remove(String name) {
+        return map.remove(name);
+    }
+
     @Override
     public String toString() {
-        return Json.write(map);
+        return SimpleJsonCodec.write(map);
     }
 }
